@@ -1,10 +1,17 @@
 package lcd
 
 import (
+	"bufio"
+	"bytes"
+	"cosmos-sdk/client/input"
+	"cosmos-sdk/crypto"
+	"cosmos-sdk/crypto/keys"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -106,4 +113,239 @@ func (rs *RestServer) registerSwaggerUI() {
 	}
 	staticServer := http.FileServer(statikFS)
 	rs.Mux.PathPrefix("/swagger-ui/").Handler(http.StripPrefix("/swagger-ui/", staticServer))
+}
+
+func (rs *RestServer) CliWalletRoutes(cliCtx context.CLIContext, r *mux.Router, storeName string) {
+	r.HandleFunc(
+		"/auth/createwallet", CliWalleCreateRequestHandlerFn(cliCtx),
+	).Methods("GET").Queries("psword", "{psword:[a-zA-Z0-9]+}", "name", "{name:[a-zA-Z0-9]+}")
+}
+
+func CliWalleCreateRequestHandlerFn(cliCtx context.CLIContext) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		fmt.Println("Vars:", vars["psword"])
+
+	}
+}
+
+func getKeybase(transient bool, buf io.Reader) (keys.Keybase, error) {
+	if transient {
+		return keys.NewInMemory(), nil
+	}
+
+	return NewKeyringFromHomeFlag(buf)
+}
+
+func runAddCmd(cmd *cobra.Command, args []string) error {
+	inBuf := bufio.NewReader(cmd.InOrStdin())
+	kb, err := getKeybase(viper.GetBool(flagDryRun), inBuf)
+	if err != nil {
+		return err
+	}
+
+	return RunAddCmd(cmd, args, kb, inBuf)
+}
+
+/*
+input
+	- bip39 mnemonic
+	- bip39 passphrase
+	- bip44 path
+	- local encryption password
+output
+	- armor encrypted private key (saved to file)
+*/
+func RunAddCmd(cmd *cobra.Command, args []string, kb keys.Keybase, inBuf *bufio.Reader) error {
+	var err error
+
+	name := args[0]
+
+	interactive := viper.GetBool(flagInteractive)
+	showMnemonic := !viper.GetBool(flagNoBackup)
+
+	if !viper.GetBool(flagDryRun) {
+		_, err = kb.Get(name)
+		if err == nil {
+			// account exists, ask for user confirmation
+			response, err2 := input.GetConfirmation(fmt.Sprintf("override the existing name %s", name), inBuf)
+			if err2 != nil {
+				return err2
+			}
+			if !response {
+				return errors.New("aborted")
+			}
+		}
+
+		multisigKeys := viper.GetStringSlice(flagMultisig)
+		if len(multisigKeys) != 0 {
+			var pks []crypto.PubKey
+
+			multisigThreshold := viper.GetInt(flagMultiSigThreshold)
+			if err := validateMultisigThreshold(multisigThreshold, len(multisigKeys)); err != nil {
+				return err
+			}
+
+			for _, keyname := range multisigKeys {
+				k, err := kb.Get(keyname)
+				if err != nil {
+					return err
+				}
+				pks = append(pks, k.GetPubKey())
+			}
+
+			// Handle --nosort
+			if !viper.GetBool(flagNoSort) {
+				sort.Slice(pks, func(i, j int) bool {
+					return bytes.Compare(pks[i].Address(), pks[j].Address()) < 0
+				})
+			}
+
+			pk := multisig.NewPubKeyMultisigThreshold(multisigThreshold, pks)
+			if _, err := kb.CreateMulti(name, pk); err != nil {
+				return err
+			}
+
+			cmd.PrintErrf("Key %q saved to disk.\n", name)
+			return nil
+		}
+	}
+
+	if viper.GetString(FlagPublicKey) != "" {
+		pk, err := sdk.GetPubKeyFromBech32(sdk.Bech32PubKeyTypeAccPub, viper.GetString(FlagPublicKey))
+		if err != nil {
+			return err
+		}
+		_, err = kb.CreateOffline(name, pk)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	account := uint32(viper.GetInt(flagAccount))
+	index := uint32(viper.GetInt(flagIndex))
+
+	// If we're using ledger, only thing we need is the path and the bech32 prefix.
+	if viper.GetBool(flags.FlagUseLedger) {
+		bech32PrefixAccAddr := sdk.GetConfig().GetBech32AccountAddrPrefix()
+		info, err := kb.CreateLedger(name, keys.Secp256k1, bech32PrefixAccAddr, account, index)
+		if err != nil {
+			return err
+		}
+
+		return printCreate(cmd, info, false, "")
+	}
+
+	// Get bip39 mnemonic
+	var mnemonic string
+	var bip39Passphrase string
+
+	if interactive || viper.GetBool(flagRecover) {
+		bip39Message := "Enter your bip39 mnemonic"
+		if !viper.GetBool(flagRecover) {
+			bip39Message = "Enter your bip39 mnemonic, or hit enter to generate one."
+		}
+
+		mnemonic, err = input.GetString(bip39Message, inBuf)
+		if err != nil {
+			return err
+		}
+
+		if !bip39.IsMnemonicValid(mnemonic) {
+			return errors.New("invalid mnemonic")
+		}
+	}
+
+	if len(mnemonic) == 0 {
+		// read entropy seed straight from crypto.Rand and convert to mnemonic
+		entropySeed, err := bip39.NewEntropy(mnemonicEntropySize)
+		if err != nil {
+			return err
+		}
+
+		mnemonic, err = bip39.NewMnemonic(entropySeed)
+		if err != nil {
+			return err
+		}
+	}
+
+	// override bip39 passphrase
+	if interactive {
+		bip39Passphrase, err = input.GetString(
+			"Enter your bip39 passphrase. This is combined with the mnemonic to derive the seed. "+
+				"Most users should just hit enter to use the default, \"\"", inBuf)
+		if err != nil {
+			return err
+		}
+
+		// if they use one, make them re-enter it
+		if len(bip39Passphrase) != 0 {
+			p2, err := input.GetString("Repeat the passphrase:", inBuf)
+			if err != nil {
+				return err
+			}
+
+			if bip39Passphrase != p2 {
+				return errors.New("passphrases don't match")
+			}
+		}
+	}
+
+	info, err := kb.CreateAccount(name, mnemonic, bip39Passphrase, DefaultKeyPass, account, index)
+	if err != nil {
+		return err
+	}
+
+	// Recover key from seed passphrase
+	if viper.GetBool(flagRecover) {
+		// Hide mnemonic from output
+		showMnemonic = false
+		mnemonic = ""
+	}
+
+	return printCreate(cmd, info, showMnemonic, mnemonic)
+}
+
+func printCreate(cmd *cobra.Command, info keys.Info, showMnemonic bool, mnemonic string) error {
+	output := viper.Get(cli.OutputFlag)
+
+	switch output {
+	case OutputFormatText:
+		cmd.PrintErrln()
+		printKeyInfo(info, keys.Bech32KeyOutput)
+
+		// print mnemonic unless requested not to.
+		if showMnemonic {
+			cmd.PrintErrln("\n**Important** write this mnemonic phrase in a safe place.")
+			cmd.PrintErrln("It is the only way to recover your account if you ever forget your password.")
+			cmd.PrintErrln("")
+			cmd.PrintErrln(mnemonic)
+		}
+	case OutputFormatJSON:
+		out, err := keys.Bech32KeyOutput(info)
+		if err != nil {
+			return err
+		}
+
+		if showMnemonic {
+			out.Mnemonic = mnemonic
+		}
+
+		var jsonString []byte
+		if viper.GetBool(flags.FlagIndentResponse) {
+			jsonString, err = KeysCdc.MarshalJSONIndent(out, "", "  ")
+		} else {
+			jsonString, err = KeysCdc.MarshalJSON(out)
+		}
+
+		if err != nil {
+			return err
+		}
+		cmd.PrintErrln(string(jsonString))
+	default:
+		return fmt.Errorf("invalid output format %s", output)
+	}
+
+	return nil
 }
