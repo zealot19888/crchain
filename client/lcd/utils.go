@@ -2,6 +2,7 @@ package lcd
 
 import (
 	"fmt"
+	"gopkg.in/yaml.v2"
 	"io"
 	"path/filepath"
 
@@ -46,11 +47,28 @@ func NewKeyringFromHomeFlag(input io.Reader, opts ...keys.KeybaseOption) (keys.K
 	return NewKeyringFromDir(viper.GetString(flags.FlagHome), input, opts...)
 }
 
+func NewKeyringFromHomeHttp(input map[string]string, opts ...keys.KeybaseOption) (keys.Keybase, error) {
+	return NewKeyringFromDirHttp(viper.GetString(flags.FlagHome), input, opts...)
+}
+
 // NewKeyBaseFromDir initializes a keyring at the given directory.
 // If the viper flag flags.FlagKeyringBackend is set to file, it returns an on-disk keyring with
 // CLI prompt support only. If flags.FlagKeyringBackend is set to test it will return an on-disk,
 // password-less keyring that could be used for testing purposes.
 func NewKeyringFromDir(rootDir string, input io.Reader, opts ...keys.KeybaseOption) (keys.Keybase, error) {
+	keyringBackend := viper.GetString(flags.FlagKeyringBackend)
+	switch keyringBackend {
+	case flags.KeyringBackendTest:
+		return keys.NewTestKeyring(sdk.GetConfig().GetKeyringServiceName(), rootDir, opts...)
+	case flags.KeyringBackendFile:
+		return keys.NewKeyringFile(sdk.GetConfig().GetKeyringServiceName(), rootDir, input, opts...)
+	case flags.KeyringBackendOS:
+		return keys.NewKeyring(sdk.GetConfig().GetKeyringServiceName(), rootDir, input, opts...)
+	}
+	return nil, fmt.Errorf("unknown keyring backend %q", keyringBackend)
+}
+
+func NewKeyringFromDirHttp(rootDir string, input map[string]string, opts ...keys.KeybaseOption) (keys.Keybase, error) {
 	keyringBackend := viper.GetString(flags.FlagKeyringBackend)
 	switch keyringBackend {
 	case flags.KeyringBackendTest:

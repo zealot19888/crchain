@@ -1,13 +1,16 @@
 package lcd
 
 import (
-	"bufio"
+	//"bufio"
 	"bytes"
-	"cosmos-sdk/client/input"
-	"cosmos-sdk/crypto"
-	"cosmos-sdk/crypto/keys"
+	"errors"
+	//"cosmos-sdk/client/input"
 	"fmt"
-	"io"
+	"github.com/cosmos/cosmos-sdk/crypto"
+	"github.com/cosmos/cosmos-sdk/crypto/keys"
+	"github.com/tendermint/tendermint/crypto/multisig"
+	"github.com/tendermint/tendermint/libs/cli"
+	//"io"
 	"net"
 	"net/http"
 	"os"
@@ -23,11 +26,29 @@ import (
 
 	"github.com/cosmos/cosmos-sdk/client/context"
 	"github.com/cosmos/cosmos-sdk/client/flags"
+	"github.com/cosmos/cosmos-sdk/client/input"
 	"github.com/cosmos/cosmos-sdk/codec"
 	"github.com/cosmos/cosmos-sdk/server"
 
 	// unnamed import of statik for swagger UI support
 	_ "github.com/cosmos/cosmos-sdk/client/lcd/statik"
+)
+
+type WalletRestConfig struct {
+}
+
+const (
+	flagInteractive = "interactive"
+	flagRecover     = "recover"
+	flagNoBackup    = "no-backup"
+	flagDryRun      = "dry-run"
+	flagAccount     = "account"
+	flagIndex       = "index"
+	flagMultisig    = "multisig"
+	flagNoSort      = "nosort"
+
+	// DefaultKeyPass contains the default key password for genesis transactions
+	DefaultKeyPass = "12345678"
 )
 
 // RestServer represents the Light Client Rest server
@@ -116,6 +137,20 @@ func (rs *RestServer) registerSwaggerUI() {
 }
 
 func (rs *RestServer) CliWalletRoutes(cliCtx context.CLIContext, r *mux.Router, storeName string) {
+	var config WalletRestConfig
+	viper.Set("flagMultisig", nil)
+	viper.Set("flagMultiSigThreshold", 1)
+	viper.Set("flagNoSort", false)
+	viper.Set("FlagPublicKey", "")
+	viper.Set("flagInteractive", false)
+	viper.Set(flags.FlagUseLedger, false)
+	viper.Set("flagRecover", false)
+	viper.Set("flagNoBackup", false)
+	viper.Set("flagDryRun", false)
+	viper.Set("flagAccount", 0)
+	viper.Set("flagIndex", 0)
+	viper.Set(flags.FlagIndentResponse, false)
+	viper.Unmarshal(&config)
 	r.HandleFunc(
 		"/auth/createwallet", CliWalleCreateRequestHandlerFn(cliCtx),
 	).Methods("GET").Queries("psword", "{psword:[a-zA-Z0-9]+}", "name", "{name:[a-zA-Z0-9]+}")
@@ -125,26 +160,26 @@ func CliWalleCreateRequestHandlerFn(cliCtx context.CLIContext) http.HandlerFunc 
 	return func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
 		fmt.Println("Vars:", vars["psword"])
-
+		runAddCmd(w, r, vars)
 	}
 }
 
-func getKeybase(transient bool, buf io.Reader) (keys.Keybase, error) {
+func getKeybase(transient bool, buf map[string]string) (keys.Keybase, error) {
 	if transient {
 		return keys.NewInMemory(), nil
 	}
 
-	return NewKeyringFromHomeFlag(buf)
+	return NewKeyringFromHomeHttp(buf)
 }
 
-func runAddCmd(cmd *cobra.Command, args []string) error {
-	inBuf := bufio.NewReader(cmd.InOrStdin())
-	kb, err := getKeybase(viper.GetBool(flagDryRun), inBuf)
+func runAddCmd(w http.ResponseWriter, r *http.Request, datas map[string]string) error {
+	// 读取commad 命令的字符串
+	kb, err := getKeybase(viper.GetBool(flagDryRun), datas)
 	if err != nil {
 		return err
 	}
 
-	return RunAddCmd(cmd, args, kb, inBuf)
+	return RunAddCmd(kb, datas)
 }
 
 /*
@@ -156,10 +191,10 @@ input
 output
 	- armor encrypted private key (saved to file)
 */
-func RunAddCmd(cmd *cobra.Command, args []string, kb keys.Keybase, inBuf *bufio.Reader) error {
+func RunAddCmd(kb keys.Keybase, inBuf map[string]string) error {
 	var err error
 
-	name := args[0]
+	name := inBuf["name"]
 
 	interactive := viper.GetBool(flagInteractive)
 	showMnemonic := !viper.GetBool(flagNoBackup)
